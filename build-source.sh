@@ -15,6 +15,21 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+# Accepts file paths. Print the first file that exists, or nothing if none exists.
+first_existing_file () {
+  while [ -n "$1" ]; do
+    if [ -e "$1" ]; then
+      echo "$1"
+      return
+    fi
+
+    shift
+  done
+}
+
+sourcedebian_or_source () {
+  first_existing_file "source/debian/${1}" "source/${1}"
+}
 
 # Multi distro, set here to build master for multripple distros!
 BUILD_DISTS_MULTI="xenial focal"
@@ -43,23 +58,54 @@ export GIT_COMMIT=$(git rev-parse HEAD)
 export GIT_BRANCH=$BRANCH_NAME
 cd ..
 
-if [ -f source/ubports.source_location ]; then
+source_location_file=$(sourcedebian_or_source ubports.source_location)
+if [ -n "$source_location_file" ]; then
   while read -r SOURCE_URL && read -r SOURCE_FILENAME; do
     if [ -f "$SOURCE_FILENAME" ]; then
       rm "$SOURCE_FILENAME"
     fi
 
     wget -O "$SOURCE_FILENAME" "$SOURCE_URL"
-  done <source/ubports.source_location
+  done <"$source_location_file"
 
   export IGNORE_GIT_BUILDPACKAGE=true
   export USE_ORIG_VERSION=true
   export SKIP_DCH=true
   export SKIP_PRE_CLEANUP=true
   export SKIP_GIT_CLEANUP=true
-  rm source/Jenkinsfile || true
-  rm source/ubports.source_location || true
+  # Always include the original source in the .changes file.
+  # Ideally we should do this only when we have a new upstream version, but
+  # I'm too lazy to check if a source package is already in the repo.
+  # This is primarily to please Aptly, and Aptly seems to check for file
+  # duplication anyway. (see dpkg-genchanges manpage)
+  export DBP_EXTRA_OPTS="-sa"
+
+  rm "$source_location_file" || true
+  existing_file=$(sourcedebian_or_source Jenkinsfile)
+  if [ -n "$existing_file" ]; then
+    rm "$existing_file" || true
+  fi
 fi
+
+# Move files controlling the build process under UBports CI to a directory.
+# This prevents dpkg-buildpackage from error out and generate-git-snapshot from
+# removing these files during there cleanup process.
+mkdir -p buildinfos
+for file in \
+    ubports.depends \
+    ubports.no_test \
+    ubports.no_doc \
+    ubports.build_profiles \
+    ubports.backports \
+  ; do
+  existing_file=$(sourcedebian_or_source "$file")
+  if [ -n "$existing_file" ]; then
+    # Move them out of the way so that dpkg-buildpackage won't trip.
+    # (And to allow us to inspect the file without extracting debian package
+    # in the next step)
+    mv "$existing_file" "buildinfos/${file}.buildinfo"
+  fi
+done
 
 if echo $VALID_DISTS | grep -w $GIT_BRANCH > /dev/null; then
         echo "This is on a release branch, overriding dist to $GIT_BRANCH"
@@ -87,53 +133,63 @@ if [ "$GIT_BRANCH" = "master" ]; then
   tar -zcvf multidist.tar.gz mbuild
   echo "$BUILD_DISTS_MULTI" > multidist.buildinfo
 else
+  if [ -n "$CHANGE_ID" ]; then
+    # This is a PR. Publish each PR for each project into its own repository
+
+    if [ -n "$GIT_URL" ]; then
+      echo "DEBUG: \$GIT_URL is ${GIT_URL}"
+    elif [ -n "$GIT_URL_1" ]; then
+      echo "DEBUG: Set \$GIT_URL to \$GIT_URL_1, which is ${GIT_URL_1}"
+      GIT_URL=$GIT_URL_1
+    else
+      GIT_URL=$( (cd source && git remote get-url origin) || true)
+      echo "DEBUG: Set \$GIT_URL to git repo's origin remote url, which is ${GIT_URL}"
+    fi
+
+    if [ -n "$GIT_URL" ]; then
+      GIT_REPO_NAME="$(basename "${GIT_URL%.git}")"
+    else
+      echo "Cannot determine git repo name. Try to use the job name instead." \
+          "May produce incorrect apt repository name."
+      GIT_REPO_NAME=$JOB_BASE_NAME
+    fi
+
+    REPOS="PR_${GIT_REPO_NAME}_${CHANGE_ID}"
+
+    # We want the target branch to be part of our repo dependency (in addition to
+    # what's specified in ubports.depends)
+    # TODO: support specifying PRs as a dependency in the PR body.
+
+    if [ -n "${CHANGE_TARGET}" ]; then
+      # Remove "ubports/" prefix if present
+      echo "${CHANGE_TARGET#ubports/}" >> buildinfos/ubports.depends.buildinfo
+    fi
+  else
+    # Support both ubports/xenial(_-_.*)? and xenial(_-_.*)?
+    REPOS="${GIT_BRANCH#ubports/}"
+
+    # Parse branch architecture extension
+    if echo "$REPOS" | grep -q '@[a-z]*$'; then
+      REQUEST_ARCH="${REPOS#*@}"
+      REPOS="${REPOS%@*}"
+    fi
+  fi
+
   export TIMESTAMP_FORMAT="$d%Y%m%d%H%M%S"
   /usr/bin/generate-git-snapshot
   echo "Gen git snapshot done"
-fi
 
-if [ -n "$CHANGE_ID" ]; then
-  # This is a PR. Publish each PR for each project into its own repository
-  GIT_REPO_NAME="$(basename "${GIT_URL%.git}")"
-  REPOS="PR_${GIT_REPO_NAME}_${CHANGE_ID}"
-
-  # We want the target branch to be part of our repo dependency (in addition to
-  # what's specified in ubports.depends)
-  # TODO: support specifying PRs as a dependency in the PR body.
-
-  if [ -n "${CHANGE_TARGET}" ]; then
-    # Remove "ubports/" prefix if present
-    echo "${CHANGE_TARGET#ubports/}" >> source/ubports.depends
-  fi
-else
-  # Support both ubports/xenial(_-_.*)? and xenial(_-_.*)?
-  REPOS="${GIT_BRANCH#ubports/}"
-
-  # Parse branch architecture extension
-  if echo "$REPOS" | grep -q '@[a-z]*$'; then
-    REQUEST_ARCH="${REPOS#*@}"
-    REPOS="${REPOS%@*}"
+  echo "$REPOS" >buildinfos/ubports.target_apt_repository.buildinfo
+  if [ -n "$REQUEST_ARCH" ]; then
+    if echo "$VALID_ARCHS" | grep -q "$REQUEST_ARCH"; then
+      echo "$REQUEST_ARCH" >buildinfos/ubports.architecture.buildinfo
+    else
+      echo "ERROR: Arch '${REQUEST_ARCH}' is not valid"
+      exit 1
+    fi
   fi
 fi
 
-echo "$REPOS" >ubports.target_apt_repository.buildinfo
-if [ -n "$REQUEST_ARCH" ]; then
-  if echo "$VALID_ARCHS" | grep -q "$REQUEST_ARCH"; then
-    echo "$REQUEST_ARCH" >ubports.architecture.buildinfo
-  else
-    echo "ERROR: Arch '${REQUEST_ARCH}' is not valid"
-    exit 1
-  fi
-fi
-
-for file in \
-    ubports.depends \
-    ubports.no_test \
-    ubports.no_doc \
-    ubports.build_profiles \
-    ubports.backports \
-  ; do
-  if [ -f source/$file ]; then
-    cp source/$file $file.buildinfo
-  fi
-done
+# Move buildinfos back to the workspace root, so that they'll be stashed.
+mv buildinfos/* . || true
+rm -rf buildinfos || true
